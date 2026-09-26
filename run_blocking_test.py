@@ -28,8 +28,8 @@ from candidate_generator import generate_candidates
 
 # ============================================================ Configuration
 # Use the SAME config validated on training data
-TFIDF_K = 50
-CANDIDATE_CAP = 75
+TFIDF_K = 100
+CANDIDATE_CAP = 300
 
 LOAD_COLS = [
     "entity_id", "country",

@@ -30,10 +30,10 @@ from candidate_generator import generate_candidates
 from evaluate_blocking import evaluate, print_missed_pairs_analysis
 
 # ============================================================ Configuration
-TFIDF_K = 50         # top-K TF-IDF neighbours per S1 record
-CANDIDATE_CAP = 75   # max candidates kept per S1 entity after union
+TFIDF_K = 100        # top-K TF-IDF neighbours per S1 record
+CANDIDATE_CAP = 300  # max candidates kept per S1 entity after union
 EXPERIMENT_ID = 2
-STRATEGIES_DESC = "Country multi-key blocking incl. AddressPrefix6 + TF-IDF char 2-4 gram fallback"
+STRATEGIES_DESC = "7-key country blocking (phonetic, token, words, address/name prefixes) + TF-IDF char 2-4 fallback"
 NGRAM_RANGE = "(2,4)"
 RECALL_TARGET = 0.95
 
@@ -56,7 +56,7 @@ NOTES = (
     f"Sample pass (n={args.sample}, seed=42, "
     f"{'full S2/S3 pool' if args.pool_limit == 0 else f'pool limit={args.pool_limit}'})"
     if USE_SAMPLE else
-    "Full training set evaluation"
+    "Targeted pass after cap-75 recall miss; full training pool"
 )
 
 # ================================================================ Load data

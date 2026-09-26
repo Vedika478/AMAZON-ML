@@ -13,6 +13,8 @@ Multi-key blocking (pure vectorized pandas):
   Key 5: Country + Address Prefix (4 chars) + Name Prefix (3 chars)
   Key 6: Country + Broad Phonetic Key (small blocks only)
     Key 7: Country + Address Prefix (6 chars)
+    Key 8: Country + Address Words (house-number independent)
+    Key 7: Country + Address Prefix (6 chars)
 
 Candidates are ranked by how many independent keys "voted" for them,
 so the final cap keeps the most-corroborated candidates, not an
@@ -272,6 +274,22 @@ def generate_candidates(
                [f"{c}|{a}" for c, a in zip(s23_country, s23_addr6)],
                max_per_block=candidate_cap, block_size_limit=500)
 
+    print("  Key 8: Country + Address Words ...", flush=True)
+    def _address_words(series):
+        def _signature(value):
+            words = [word for word in str(value).split()
+                     if word.isalpha() and len(word) >= 3]
+            return " ".join(words[:3])
+        return series.apply(_signature).values
+
+    s1_addr_words = _address_words(s1_df["normalized_address"])
+    s23_addr_words = _address_words(s23_df["normalized_address"])
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{a}" for c, a in zip(s1_country, s1_addr_words)],
+               s23_ids,
+               [f"{c}|{a}" for c, a in zip(s23_country, s23_addr_words)],
+               max_per_block=candidate_cap, block_size_limit=500)
+
     # ---- Vote-based ranking + final cap ----
     print("  Ranking by vote count and capping ...", flush=True)
     all_s1_ids = s1_df["entity_id"].tolist()
@@ -304,7 +322,9 @@ def generate_candidates(
             existing = set(final.get(s1_id, []))
             valid_new = {eid for eid in cand_set
                          if not str(eid).startswith("S1-") and eid in s23_id_set}
-            combined = list(existing | valid_new)[:candidate_cap]
+            new_candidates = sorted(valid_new - existing)
+            combined = list(existing) + new_candidates
+            combined = combined[:candidate_cap]
             added += len(combined) - len(existing)
             final[s1_id] = combined
         print(f"  Fallback added {added:,} new candidates", flush=True)
