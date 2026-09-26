@@ -1,0 +1,3 @@
+experiment_id,strategies,tfidf_ngram_range,tfidf_k,candidate_cap,candidate_recall,reduction_ratio,avg_candidates,max_candidates,notes
+1,"Strategy A (Country+Phonetic+Prefix, Country+SortedToken) + Strategy B (TF-IDF char 2-4 grams)","(2,4)",50,75,0.0000,3.0030e-03,0.07,75,"Sample pass (n=3000, seed=42) — training data evaluation"
+1,"Strategy A (Country+Phonetic+Prefix, Country+SortedToken) + Strategy B (TF-IDF char 2-4 grams)","(2,4)",50,75,0.4458,7.0473e-06,72.73,75,"Sample pass (n=200, seed=42, full S2/S3 pool)"

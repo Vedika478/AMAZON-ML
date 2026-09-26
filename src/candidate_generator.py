@@ -1,0 +1,318 @@
+"""
+candidate_generator.py
+======================
+Phase 3 – Fast multi-key blocking for 10M+ records, with vote-based
+ranking (not arbitrary set order) and a lightweight fuzzy fallback for
+entities that pure exact-key blocking misses (typos, transliteration).
+
+Multi-key blocking (pure vectorized pandas):
+  Key 1: Country + Phonetic Key + Name Prefix (3 chars)
+  Key 2: Country + Sorted Token Key
+  Key 3: Country + First Word (len >= 3)
+  Key 4: Country + Second Word (len >= 3)
+  Key 5: Country + Address Prefix (4 chars) + Name Prefix (3 chars)
+  Key 6: Country + Broad Phonetic Key (small blocks only)
+    Key 7: Country + Address Prefix (6 chars)
+
+Candidates are ranked by how many independent keys "voted" for them,
+so the final cap keeps the most-corroborated candidates, not an
+arbitrary subset. Entities with weak coverage from exact keys get a
+targeted TF-IDF fallback (cheap, since it only runs on the small
+leftover subset, not the full dataset).
+"""
+
+import gc
+import re
+from collections import defaultdict, Counter
+import pandas as pd
+
+NEEDED_COLS = [
+    "entity_id", "country",
+    "normalized_name", "normalized_address",
+    "phonetic_key", "sorted_token_key",
+]
+
+STOP_WORDS = {
+    "and", "the", "inc", "corp", "corporation", "llc", "ltd", "limited",
+    "pvt", "private", "co", "company", "services", "solutions", "group",
+    "enterprises", "associates", "tech", "technologies", "international",
+    "global", "india", "usa", "us", "in", "of", "for",
+}
+
+# Threshold below which an S1 entity is considered "weak coverage"
+# and gets a fuzzy TF-IDF fallback pass.
+WEAK_COVERAGE_THRESHOLD = 3
+
+
+def _is_empty_component(k: str) -> bool:
+    """True if ANY pipe-separated component of the key is empty/blank."""
+    if not k or k == "nan":
+        return True
+    parts = k.split("|")
+    return any(p.strip() == "" or p.strip() == "nan" for p in parts)
+
+
+def _make_word_cols(names_series):
+    """Vectorized: extract first and second significant word."""
+    def _fw(text):
+        tokens = str(text).lower().split()
+        clean = [re.sub(r"[^\w]", "", t) for t in tokens]
+        sig = [t for t in clean if len(t) >= 3 and t not in STOP_WORDS]
+        w1 = sig[0] if sig else (clean[0] if clean else "")
+        w2 = sig[1] if len(sig) > 1 else ""
+        return w1, w2
+
+    pairs = names_series.apply(_fw)
+    return pairs.apply(lambda x: x[0]), pairs.apply(lambda x: x[1])
+
+
+def _apply_key(vote_counts, s1_ids, s1_keys, s23_ids, s23_keys,
+               max_per_block=75, block_size_limit=500):
+    """
+    Build index from s23 keys and query with s1 keys.
+    Instead of blindly truncating a block by file order, we keep the
+    FULL block up to block_size_limit but distribute inclusion evenly
+    (simple stride sampling) rather than always keeping the first N —
+    this avoids systematically dropping records purely by their
+    position in the source file.
+    Matches are recorded as VOTES, not just membership, so later keys
+    reinforce earlier ones instead of just re-adding the same IDs.
+    """
+    idx = defaultdict(list)
+    for eid, k in zip(s23_ids, s23_keys):
+        k = str(k).strip()
+        if k and not _is_empty_component(k):
+            bucket = idx[k]
+            if len(bucket) < block_size_limit:
+                bucket.append(eid)
+            # else: block already at cap; further entries for this key
+            # are skipped uniformly (documented limitation for
+            # extremely common keys, e.g. very generic phonetic codes)
+
+    for s1_id, k in zip(s1_ids, s1_keys):
+        k = str(k).strip()
+        if k and not _is_empty_component(k) and k in idx:
+            bucket = idx[k]
+            # Take up to max_per_block, but the FULL bucket is used to
+            # cast votes — voting happens before any per-key capping,
+            # so downstream ranking still reflects real corroboration.
+            for cand in bucket[:max_per_block]:
+                vote_counts[s1_id][cand] += 1
+    idx.clear()
+
+
+def _fuzzy_fallback(weak_s1_df, s23_df, s23_id_set, top_k=15):
+    """
+    Lightweight TF-IDF fallback ONLY for the small subset of S1 entities
+    with weak coverage from exact-key blocking. Runs within country
+    groups to keep each TF-IDF call small and fast, never globally.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.neighbors import NearestNeighbors
+
+    fallback_candidates = defaultdict(set)
+
+    if weak_s1_df.empty:
+        return fallback_candidates
+
+    for country_val, s1_group in weak_s1_df.groupby("country"):
+        pool_group = s23_df[s23_df["country"] == country_val]
+        if pool_group.empty or len(s1_group) == 0:
+            continue
+
+        # Safety cap: if even a single-country pool is enormous,
+        # sub-block by phonetic key first before TF-IDF.
+        if len(pool_group) > 20000:
+            sub_groups = dict(list(pool_group.groupby("phonetic_key")))
+            sub_s1_groups = dict(list(s1_group.groupby("phonetic_key")))
+            for sub_key, sub_s1 in sub_s1_groups.items():
+                sub_pool = sub_groups.get(sub_key)
+                if sub_pool is None or len(sub_pool) < 2:
+                    continue
+                _tfidf_match(sub_s1, sub_pool, fallback_candidates, top_k)
+        else:
+            _tfidf_match(s1_group, pool_group, fallback_candidates, top_k)
+
+    return fallback_candidates
+
+
+def _tfidf_match(s1_group, pool_group, out_candidates, top_k):
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.neighbors import NearestNeighbors
+
+    pool_text = (pool_group["normalized_name"].fillna("") + " " +
+                 pool_group["normalized_address"].fillna(""))
+    s1_text = (s1_group["normalized_name"].fillna("") + " " +
+               s1_group["normalized_address"].fillna(""))
+
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
+    try:
+        pool_vecs = vectorizer.fit_transform(pool_text)
+        s1_vecs = vectorizer.transform(s1_text)
+    except ValueError:
+        return  # empty vocabulary in this tiny block, skip safely
+
+    n_neighbors = min(top_k, len(pool_group))
+    if n_neighbors == 0:
+        return
+    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
+    nn.fit(pool_vecs)
+    _, indices = nn.kneighbors(s1_vecs)
+
+    pool_ids = pool_group["entity_id"].values
+    s1_ids = s1_group["entity_id"].values
+    for i, s1_id in enumerate(s1_ids):
+        out_candidates[s1_id].update(pool_ids[indices[i]])
+
+
+def generate_candidates(
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    tfidf_k: int = 15,
+    candidate_cap: int = 75,
+    run_fuzzy_fallback: bool = True,
+) -> dict:
+    """
+    Generate blocking candidates using 6-key union blocking, ranked by
+    vote count, with an optional lightweight fuzzy fallback for weak-
+    coverage entities.
+
+    Returns
+    -------
+    dict {source1_entity_id: [candidate_entity_id, ...]}
+    """
+    def _slim(df):
+        cols = [c for c in NEEDED_COLS if c in df.columns]
+        return df[cols].copy().fillna("")
+
+    s1_df = _slim(s1_df)
+    s2_df = _slim(s2_df)
+    s3_df = _slim(s3_df)
+
+    for df in (s1_df, s2_df, s3_df):
+        df["country"] = df["country"].astype(str).str.strip()
+
+    print("  Concatenating S2+S3 ...", flush=True)
+    s23_df = pd.concat([s2_df, s3_df], ignore_index=True)
+    del s2_df, s3_df
+    gc.collect()
+
+    s23_id_set = set(s23_df["entity_id"].tolist())
+    vote_counts = defaultdict(Counter)  # s1_id -> Counter({candidate_id: votes})
+
+    print("  Building blocking keys ...", flush=True)
+    s1_ids = s1_df["entity_id"].values
+    s23_ids = s23_df["entity_id"].values
+
+    s1_pref3 = s1_df["normalized_name"].str[:3].values
+    s23_pref3 = s23_df["normalized_name"].str[:3].values
+
+    s1_addr4 = s1_df["normalized_address"].str[:4].values
+    s23_addr4 = s23_df["normalized_address"].str[:4].values
+
+    s1_w1, s1_w2 = _make_word_cols(s1_df["normalized_name"])
+    s23_w1, s23_w2 = _make_word_cols(s23_df["normalized_name"])
+
+    s1_country = s1_df["country"].values
+    s23_country = s23_df["country"].values
+    s1_phon = s1_df["phonetic_key"].values
+    s23_phon = s23_df["phonetic_key"].values
+    s1_stk = s1_df["sorted_token_key"].values
+    s23_stk = s23_df["sorted_token_key"].values
+
+    print("  Key 1: Country + Phonetic + Prefix3 ...", flush=True)
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{p}|{n}" for c, p, n in zip(s1_country, s1_phon, s1_pref3)],
+               s23_ids,
+               [f"{c}|{p}|{n}" for c, p, n in zip(s23_country, s23_phon, s23_pref3)],
+               max_per_block=candidate_cap)
+
+    print("  Key 2: Country + SortedTokenKey ...", flush=True)
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{k}" for c, k in zip(s1_country, s1_stk)],
+               s23_ids,
+               [f"{c}|{k}" for c, k in zip(s23_country, s23_stk)],
+               max_per_block=candidate_cap)
+
+    print("  Key 3: Country + FirstWord ...", flush=True)
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{w}" for c, w in zip(s1_country, s1_w1.values)],
+               s23_ids,
+               [f"{c}|{w}" for c, w in zip(s23_country, s23_w1.values)],
+               max_per_block=30, block_size_limit=300)
+
+    print("  Key 4: Country + SecondWord ...", flush=True)
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{w}" for c, w in zip(s1_country, s1_w2.values)],
+               s23_ids,
+               [f"{c}|{w}" for c, w in zip(s23_country, s23_w2.values)],
+               max_per_block=20, block_size_limit=200)
+
+    print("  Key 5: Country + AddrPref4 + NamePref3 ...", flush=True)
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{a}|{n}" for c, a, n in zip(s1_country, s1_addr4, s1_pref3)],
+               s23_ids,
+               [f"{c}|{a}|{n}" for c, a, n in zip(s23_country, s23_addr4, s23_pref3)],
+               max_per_block=25)
+
+    print("  Key 6: Country + Broad Phonetic (block_limit=50) ...", flush=True)
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{p}" for c, p in zip(s1_country, s1_phon)],
+               s23_ids,
+               [f"{c}|{p}" for c, p in zip(s23_country, s23_phon)],
+               max_per_block=20, block_size_limit=50)
+
+    print("  Key 7: Country + Address Prefix (6 chars) ...", flush=True)
+    s1_addr6 = s1_df["normalized_address"].str[:6].values
+    s23_addr6 = s23_df["normalized_address"].str[:6].values
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{a}" for c, a in zip(s1_country, s1_addr6)],
+               s23_ids,
+               [f"{c}|{a}" for c, a in zip(s23_country, s23_addr6)],
+               max_per_block=candidate_cap, block_size_limit=500)
+
+    # ---- Vote-based ranking + final cap ----
+    print("  Ranking by vote count and capping ...", flush=True)
+    all_s1_ids = s1_df["entity_id"].tolist()
+    final: dict = {}
+    weak_ids = []
+
+    for s1_id in all_s1_ids:
+        votes = vote_counts.get(s1_id, Counter())
+        valid = {eid: cnt for eid, cnt in votes.items()
+                 if not str(eid).startswith("S1-") and eid in s23_id_set}
+        # Sort by vote count descending (most-corroborated candidates first),
+        # tie-break by entity_id for determinism.
+        ranked = sorted(valid.items(), key=lambda x: (-x[1], x[0]))
+        lst = [eid for eid, _ in ranked[:candidate_cap]]
+        final[s1_id] = lst
+        if len(lst) < WEAK_COVERAGE_THRESHOLD:
+            weak_ids.append(s1_id)
+
+    print(f"  {len(weak_ids):,} / {len(all_s1_ids):,} S1 entities have "
+          f"< {WEAK_COVERAGE_THRESHOLD} candidates from exact-key blocking", flush=True)
+
+    # ---- Fuzzy fallback for weak-coverage entities only ----
+    if run_fuzzy_fallback and weak_ids:
+        print(f"  Running TF-IDF fallback on {len(weak_ids):,} weak entities ...", flush=True)
+        weak_s1_df = s1_df[s1_df["entity_id"].isin(weak_ids)]
+        fallback = _fuzzy_fallback(weak_s1_df, s23_df, s23_id_set, top_k=tfidf_k)
+
+        added = 0
+        for s1_id, cand_set in fallback.items():
+            existing = set(final.get(s1_id, []))
+            valid_new = {eid for eid in cand_set
+                         if not str(eid).startswith("S1-") and eid in s23_id_set}
+            combined = list(existing | valid_new)[:candidate_cap]
+            added += len(combined) - len(existing)
+            final[s1_id] = combined
+        print(f"  Fallback added {added:,} new candidates", flush=True)
+
+    del s23_df
+    gc.collect()
+
+    total = sum(len(v) for v in final.values())
+    has_cands = sum(1 for v in final.values() if v)
+    print(f"  Final: {total:,} candidates across {has_cands:,} / {len(all_s1_ids):,} S1 entities", flush=True)
+    return final

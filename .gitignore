@@ -1,0 +1,10 @@
+# Local and generated data (too large for GitHub)
+dataset/
+intermediate/
+__pycache__/
+*.pyc
+
+# Local OS/editor files
+.DS_Store
+.vscode/
+
