@@ -28,8 +28,8 @@ from candidate_generator import generate_candidates
 
 # ============================================================ Configuration
 # Use the SAME config validated on training data
-TFIDF_K = 100
-CANDIDATE_CAP = 300
+TFIDF_K = 300
+CANDIDATE_CAP = 1000
 
 LOAD_COLS = [
     "entity_id", "country",
@@ -96,3 +96,4 @@ print("  reconstructed from Person 2's pre-inference candidate set,")
 print("  NOT from this file.  Confirm with Person 2 before submitting.")
 print()
 print("✅ Phase 5 (test candidates) complete.")
+

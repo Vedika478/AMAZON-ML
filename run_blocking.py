@@ -30,10 +30,10 @@ from candidate_generator import generate_candidates
 from evaluate_blocking import evaluate, print_missed_pairs_analysis
 
 # ============================================================ Configuration
-TFIDF_K = 100        # top-K TF-IDF neighbours per S1 record
-CANDIDATE_CAP = 300  # max candidates kept per S1 entity after union
-EXPERIMENT_ID = 3
-STRATEGIES_DESC = "9-key country blocking + consonant skeleton + TF-IDF char 1-3 fallback"
+TFIDF_K = 300        # top-K TF-IDF neighbours per S1 record
+CANDIDATE_CAP = 1000 # recall-first cap after union
+EXPERIMENT_ID = 6
+STRATEGIES_DESC = "country-agnostic name union + multilingual normalization + address-token union + char-TF-IDF fallback"
 NGRAM_RANGE = "(1,3)"
 RECALL_TARGET = 0.95
 
@@ -56,7 +56,7 @@ NOTES = (
     f"Sample pass (n={args.sample}, seed=42, "
     f"{'full S2/S3 pool' if args.pool_limit == 0 else f'pool limit={args.pool_limit}'})"
     if USE_SAMPLE else
-    "Targeted pass after cap-75 recall miss; full training pool"
+    "Recall-first union; country is not a hard filter; evenly sampled large blocks; cap=1000"
 )
 
 # ================================================================ Load data
@@ -233,3 +233,4 @@ with open(out_path, "w", encoding="utf-8", newline="") as f:
 
 print(f"  Written {len(all_s1_ids):,} rows.")
 print("\n✅ Phase 3 (training) complete.")
+

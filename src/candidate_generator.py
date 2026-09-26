@@ -43,7 +43,9 @@ STOP_WORDS = {
 
 # Threshold below which an S1 entity is considered "weak coverage"
 # and gets a fuzzy TF-IDF fallback pass.
-WEAK_COVERAGE_THRESHOLD = 3
+# Fuzzy retrieval has high value even when exact blocking found a few records:
+# a handful of exact candidates does not mean the true pair was retrieved.
+WEAK_COVERAGE_THRESHOLD = 100
 
 
 def _is_empty_component(k: str) -> bool:
@@ -78,6 +80,23 @@ def _consonant_skeleton(name):
     return "".join(collapsed[:6])
 
 
+def address_token_set_key(address: str, min_token_len=3, top_n_tokens=3) -> str:
+    tokens = re.findall(r"\w+", str(address).lower())
+    stop = {"road", "street", "rd", "st", "near", "opposite", "opp", "the", "and"}
+    significant = [token for token in tokens if len(token) >= min_token_len and token not in stop]
+    return "_".join(sorted(set(significant)))
+
+
+def _address_tokens(address):
+    stop = {"road", "street", "rd", "st", "near", "opposite", "opp",
+            "the", "and", "floor", "no", "number", "india", "usa"}
+    tokens = {t for t in re.findall(r"\w+", str(address).lower())
+              if len(t) >= 3 and t not in stop}
+    # Retain a few most informative tokens (numbers, street names, localities)
+    # to bound posting-list size on the multi-million-row pool.
+    return sorted(sorted(tokens, key=lambda t: (-len(t), t))[:3])
+
+
 def _apply_key(vote_counts, s1_ids, s1_keys, s23_ids, s23_keys,
                max_per_block=75, block_size_limit=500):
     """
@@ -95,11 +114,7 @@ def _apply_key(vote_counts, s1_ids, s1_keys, s23_ids, s23_keys,
         k = str(k).strip()
         if k and not _is_empty_component(k):
             bucket = idx[k]
-            if len(bucket) < block_size_limit:
-                bucket.append(eid)
-            # else: block already at cap; further entries for this key
-            # are skipped uniformly (documented limitation for
-            # extremely common keys, e.g. very generic phonetic codes)
+            bucket.append(eid)
 
     for s1_id, k in zip(s1_ids, s1_keys):
         k = str(k).strip()
@@ -108,7 +123,14 @@ def _apply_key(vote_counts, s1_ids, s1_keys, s23_ids, s23_keys,
             # Take up to max_per_block, but the FULL bucket is used to
             # cast votes — voting happens before any per-key capping,
             # so downstream ranking still reflects real corroboration.
-            for cand in bucket[:max_per_block]:
+            if len(bucket) > max_per_block:
+                # Evenly sample the full bucket; retaining the file prefix
+                # systematically lost valid records from later partitions.
+                step = len(bucket) / max_per_block
+                selected = (bucket[int(i * step)] for i in range(max_per_block))
+            else:
+                selected = iter(bucket)
+            for cand in selected:
                 vote_counts[s1_id][cand] += 1
     idx.clear()
 
@@ -119,15 +141,14 @@ def _fuzzy_fallback(weak_s1_df, s23_df, s23_id_set, top_k=15):
     with weak coverage from exact-key blocking. Runs within country
     groups to keep each TF-IDF call small and fast, never globally.
     """
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.neighbors import NearestNeighbors
-
     fallback_candidates = defaultdict(set)
 
     if weak_s1_df.empty:
         return fallback_candidates
 
-    for country_val, s1_group in weak_s1_df.groupby("country"):
+    for country_val, s1_group in weak_s1_df.groupby("country", dropna=False):
+        # Country is useful evidence, but it is incomplete/noisy. Include
+        # same-country candidates first, then allow a bounded global fallback.
         pool_group = s23_df[s23_df["country"] == country_val]
         if pool_group.empty or len(s1_group) == 0:
             continue
@@ -135,13 +156,14 @@ def _fuzzy_fallback(weak_s1_df, s23_df, s23_id_set, top_k=15):
         # Safety cap: if even a single-country pool is enormous,
         # sub-block by phonetic key first before TF-IDF.
         if len(pool_group) > 20000:
-            sub_groups = dict(list(pool_group.groupby("phonetic_key")))
-            sub_s1_groups = dict(list(s1_group.groupby("phonetic_key")))
-            for sub_key, sub_s1 in sub_s1_groups.items():
-                sub_pool = sub_groups.get(sub_key)
-                if sub_pool is None or len(sub_pool) < 2:
-                    continue
-                _tfidf_match(sub_s1, sub_pool, fallback_candidates, top_k)
+            # Broad phonetic prefix tolerates a changed Soundex code while
+            # keeping the retrieval pool tractable.
+            pool_keys = pool_group["normalized_name"].str[:1].str.casefold()
+            query_keys = s1_group["normalized_name"].str[:1].str.casefold()
+            for prefix, sub_s1 in s1_group.groupby(query_keys, dropna=False):
+                sub_pool = pool_group[pool_keys == prefix]
+                if not sub_pool.empty:
+                    _tfidf_match(sub_s1, sub_pool, fallback_candidates, top_k)
         else:
             _tfidf_match(s1_group, pool_group, fallback_candidates, top_k)
 
@@ -149,32 +171,62 @@ def _fuzzy_fallback(weak_s1_df, s23_df, s23_id_set, top_k=15):
 
 
 def _tfidf_match(s1_group, pool_group, out_candidates, top_k):
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.neighbors import NearestNeighbors
-
     pool_text = (pool_group["normalized_name"].fillna("") + " " +
                  pool_group["normalized_address"].fillna(""))
     s1_text = (s1_group["normalized_name"].fillna("") + " " +
                s1_group["normalized_address"].fillna(""))
-
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(1, 3))
+    if not len(pool_group) or not len(s1_group):
+        return
     try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.neighbors import NearestNeighbors
+        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(1, 3))
         pool_vecs = vectorizer.fit_transform(pool_text)
         s1_vecs = vectorizer.transform(s1_text)
-    except ValueError:
-        return  # empty vocabulary in this tiny block, skip safely
-
-    n_neighbors = min(top_k, len(pool_group))
-    if n_neighbors == 0:
+        n_neighbors = min(top_k, len(pool_group))
+        nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine").fit(pool_vecs)
+        _, indices = nn.kneighbors(s1_vecs)
+        pool_ids = pool_group["entity_id"].values
+        for s1_id, row in zip(s1_group["entity_id"].values, indices):
+            out_candidates[s1_id].update(pool_ids[row])
         return
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
-    nn.fit(pool_vecs)
-    _, indices = nn.kneighbors(s1_vecs)
+    except ImportError:
+        # A dependency-free sparse character TF-IDF fallback keeps retrieval
+        # available in lightweight challenge runtimes.
+        import heapq
+        from collections import Counter
 
-    pool_ids = pool_group["entity_id"].values
-    s1_ids = s1_group["entity_id"].values
-    for i, s1_id in enumerate(s1_ids):
-        out_candidates[s1_id].update(pool_ids[indices[i]])
+        def grams(text):
+            padded = " " + str(text).lower() + " "
+            return Counter(padded[i:i+n] for n in (1, 2, 3)
+                          for i in range(max(0, len(padded)-n+1)))
+
+        docs = [grams(text) for text in pool_text.tolist()]
+        df = Counter(g for doc in docs for g in doc.keys())
+        n_docs = len(docs)
+        idf = {g: (1.0 + __import__("math").log((1+n_docs)/(1+freq))) for g, freq in df.items()}
+        postings = defaultdict(list)
+        doc_norms = [0.0] * n_docs
+        for i, doc in enumerate(docs):
+            total = sum(doc.values()) or 1
+            for gram, count in doc.items():
+                weight = (count / total) * idf[gram]
+                postings[gram].append((i, weight))
+                doc_norms[i] += weight * weight
+        doc_norms = [v ** 0.5 for v in doc_norms]
+        pool_ids = pool_group["entity_id"].values
+        for s1_id, text in zip(s1_group["entity_id"].values, s1_text.tolist()):
+            query = grams(text)
+            total = sum(query.values()) or 1
+            qweights = {g: (count/total) * idf.get(g, 1.0) for g, count in query.items()}
+            qnorm = sum(v*v for v in qweights.values()) ** 0.5 or 1.0
+            scores = defaultdict(float)
+            for gram, weight in qweights.items():
+                for i, doc_weight in postings.get(gram, ()):
+                    scores[i] += weight * doc_weight
+            ranked = heapq.nlargest(min(top_k, len(scores)), scores,
+                                    key=lambda i: scores[i] / (qnorm * doc_norms[i] or 1.0))
+            out_candidates[s1_id].update(pool_ids[i] for i in ranked)
 
 
 def generate_candidates(
@@ -182,7 +234,7 @@ def generate_candidates(
     s2_df: pd.DataFrame,
     s3_df: pd.DataFrame,
     tfidf_k: int = 15,
-    candidate_cap: int = 75,
+    candidate_cap: int = 1000,
     run_fuzzy_fallback: bool = True,
 ) -> dict:
     """
@@ -233,18 +285,18 @@ def generate_candidates(
     s1_stk = s1_df["sorted_token_key"].values
     s23_stk = s23_df["sorted_token_key"].values
 
-    print("  Key 1: Country + Phonetic + Prefix3 ...", flush=True)
+    print("  Key 1: Phonetic + Name Prefix3 (country-agnostic union) ...", flush=True)
     _apply_key(vote_counts, s1_ids,
-               [f"{c}|{p}|{n}" for c, p, n in zip(s1_country, s1_phon, s1_pref3)],
+               [f"{p}|{n}" for p, n in zip(s1_phon, s1_pref3)],
                s23_ids,
-               [f"{c}|{p}|{n}" for c, p, n in zip(s23_country, s23_phon, s23_pref3)],
+               [f"{p}|{n}" for p, n in zip(s23_phon, s23_pref3)],
                max_per_block=candidate_cap)
 
-    print("  Key 2: Country + SortedTokenKey ...", flush=True)
+    print("  Key 2: SortedTokenKey (country-agnostic union) ...", flush=True)
     _apply_key(vote_counts, s1_ids,
-               [f"{c}|{k}" for c, k in zip(s1_country, s1_stk)],
+               s1_stk,
                s23_ids,
-               [f"{c}|{k}" for c, k in zip(s23_country, s23_stk)],
+               s23_stk,
                max_per_block=candidate_cap)
 
     print("  Key 3: Country + FirstWord ...", flush=True)
@@ -284,21 +336,35 @@ def generate_candidates(
                [f"{c}|{a}" for c, a in zip(s23_country, s23_addr6)],
                max_per_block=candidate_cap, block_size_limit=500)
 
-    print("  Key 8: Country + Address Words ...", flush=True)
-    def _address_words(series):
-        def _signature(value):
-            words = [word for word in str(value).split()
-                     if word.isalpha() and len(word) >= 3]
-            return " ".join(words[:3])
-        return series.apply(_signature).values
-
-    s1_addr_words = _address_words(s1_df["normalized_address"])
-    s23_addr_words = _address_words(s23_df["normalized_address"])
-    _apply_key(vote_counts, s1_ids,
-               [f"{c}|{a}" for c, a in zip(s1_country, s1_addr_words)],
-               s23_ids,
-               [f"{c}|{a}" for c, a in zip(s23_country, s23_addr_words)],
-               max_per_block=candidate_cap, block_size_limit=500)
+    # Broad address-token retrieval is run only for entities with thin exact
+    # coverage. This controls candidate explosion while allowing partial and
+    # reordered addresses to contribute a vote independently.
+    weak_address_ids = {eid for eid in s1_ids
+                        if len(vote_counts.get(eid, {})) < WEAK_COVERAGE_THRESHOLD}
+    if weak_address_ids:
+        print(f"  Key 8: Partial address tokens for {len(weak_address_ids):,} weak entities ...", flush=True)
+        s1_addr_token_rows = s1_df["normalized_address"].apply(_address_tokens).tolist()
+        s23_addr_token_rows = s23_df["normalized_address"].apply(_address_tokens).tolist()
+        query_ids, query_country, query_tokens = [], [], []
+        for eid, country, tokens in zip(s1_ids, s1_country, s1_addr_token_rows):
+            if eid in weak_address_ids:
+                for token in tokens:
+                    query_ids.append(eid)
+                    query_country.append(country)
+                    query_tokens.append(token)
+        pool_ids, pool_country, pool_tokens = [], [], []
+        for eid, country, tokens in zip(s23_ids, s23_country, s23_addr_token_rows):
+            for token in tokens:
+                pool_ids.append(eid)
+                pool_country.append(country)
+                pool_tokens.append(token)
+        _apply_key(vote_counts, query_ids,
+                   [f"{c}|{t}" for c, t in zip(query_country, query_tokens)],
+                   pool_ids,
+                   [f"{c}|{t}" for c, t in zip(pool_country, pool_tokens)],
+                   max_per_block=100, block_size_limit=500)
+        _apply_key(vote_counts, query_ids, query_tokens, pool_ids, pool_tokens,
+                   max_per_block=100, block_size_limit=500)
 
     print("  Key 9: Country + Consonant Skeleton ...", flush=True)
     s1_skeleton = s1_df["normalized_name"].apply(_consonant_skeleton).values
@@ -355,3 +421,4 @@ def generate_candidates(
     has_cands = sum(1 for v in final.values() if v)
     print(f"  Final: {total:,} candidates across {has_cands:,} / {len(all_s1_ids):,} S1 entities", flush=True)
     return final
+

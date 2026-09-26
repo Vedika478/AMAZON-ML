@@ -10,7 +10,9 @@ os.makedirs('intermediate', exist_ok=True)
 
 for i in range(1, 4):
     print(f"Processing Source {i}...")
-    df = pd.read_csv(f'dataset/train/train_source{i}.tsv', sep='\t')
+    # Keep identifiers and address/name tokens as strings (leading zeroes
+    # matter) and let the shared normalization functions handle missing data.
+    df = pd.read_csv(f'dataset/train/train_source{i}.tsv', sep='\t', dtype=str).fillna('')
     
     df['normalized_name'] = df['business_name'].apply(normalize_business_name)
     df['normalized_address'] = df['business_address'].apply(normalize_address)
@@ -31,3 +33,4 @@ for i in range(1, 4):
             print(f"PHONETIC KEY: {row['phonetic_key']}")
             print(f"SORTED TOKEN KEY: {row['sorted_token_key']}")
             print("-" * 50)
+
