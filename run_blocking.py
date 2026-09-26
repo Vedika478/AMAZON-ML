@@ -32,9 +32,9 @@ from evaluate_blocking import evaluate, print_missed_pairs_analysis
 # ============================================================ Configuration
 TFIDF_K = 100        # top-K TF-IDF neighbours per S1 record
 CANDIDATE_CAP = 300  # max candidates kept per S1 entity after union
-EXPERIMENT_ID = 2
-STRATEGIES_DESC = "7-key country blocking (phonetic, token, words, address/name prefixes) + TF-IDF char 2-4 fallback"
-NGRAM_RANGE = "(2,4)"
+EXPERIMENT_ID = 3
+STRATEGIES_DESC = "9-key country blocking + consonant skeleton + TF-IDF char 1-3 fallback"
+NGRAM_RANGE = "(1,3)"
 RECALL_TARGET = 0.95
 
 # ============================================================ CLI args

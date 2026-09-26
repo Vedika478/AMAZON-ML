@@ -68,6 +68,16 @@ def _make_word_cols(names_series):
     return pairs.apply(lambda x: x[0]), pairs.apply(lambda x: x[1])
 
 
+def _consonant_skeleton(name):
+    letters = [char for char in str(name).lower() if char.isalpha()]
+    consonants = [char for char in letters if char not in "aeiou"]
+    collapsed = []
+    for char in consonants:
+        if not collapsed or collapsed[-1] != char:
+            collapsed.append(char)
+    return "".join(collapsed[:6])
+
+
 def _apply_key(vote_counts, s1_ids, s1_keys, s23_ids, s23_keys,
                max_per_block=75, block_size_limit=500):
     """
@@ -147,7 +157,7 @@ def _tfidf_match(s1_group, pool_group, out_candidates, top_k):
     s1_text = (s1_group["normalized_name"].fillna("") + " " +
                s1_group["normalized_address"].fillna(""))
 
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(1, 3))
     try:
         pool_vecs = vectorizer.fit_transform(pool_text)
         s1_vecs = vectorizer.transform(s1_text)
@@ -288,6 +298,15 @@ def generate_candidates(
                [f"{c}|{a}" for c, a in zip(s1_country, s1_addr_words)],
                s23_ids,
                [f"{c}|{a}" for c, a in zip(s23_country, s23_addr_words)],
+               max_per_block=candidate_cap, block_size_limit=500)
+
+    print("  Key 9: Country + Consonant Skeleton ...", flush=True)
+    s1_skeleton = s1_df["normalized_name"].apply(_consonant_skeleton).values
+    s23_skeleton = s23_df["normalized_name"].apply(_consonant_skeleton).values
+    _apply_key(vote_counts, s1_ids,
+               [f"{c}|{s}" for c, s in zip(s1_country, s1_skeleton)],
+               s23_ids,
+               [f"{c}|{s}" for c, s in zip(s23_country, s23_skeleton)],
                max_per_block=candidate_cap, block_size_limit=500)
 
     # ---- Vote-based ranking + final cap ----

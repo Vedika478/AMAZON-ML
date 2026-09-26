@@ -3,3 +3,4 @@ experiment_id,strategies,tfidf_ngram_range,tfidf_k,candidate_cap,candidate_recal
 1,"Strategy A (Country+Phonetic+Prefix, Country+SortedToken) + Strategy B (TF-IDF char 2-4 grams)","(2,4)",50,75,0.4458,7.0473e-06,72.73,75,"Sample pass (n=200, seed=42, full S2/S3 pool)"
 2,"7-key country blocking (phonetic, token, words, address/name prefixes) + TF-IDF char 2-4 fallback","(2,4)",100,300,0.6347,2.4997e-05,257.97,300,Targeted pass after cap-75 recall miss; full training pool
 2,"7-key country blocking (phonetic, token, words, address/name prefixes) + TF-IDF char 2-4 fallback","(2,4)",100,300,0.7038,2.5400e-05,262.13,300,"Sample pass (n=200, seed=42, full S2/S3 pool)"
+2,"7-key country blocking (phonetic, token, words, address/name prefixes) + TF-IDF char 2-4 fallback","(2,4)",100,300,0.7496,2.5826e-05,266.53,300,"Sample pass (n=200, seed=42, full S2/S3 pool)"
