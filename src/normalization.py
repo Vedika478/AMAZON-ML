@@ -131,3 +131,4 @@ def generate_sorted_token_key(name):
     norm = normalize_business_name(name)
     tokens = sorted(norm.split())
     return " ".join(tokens)
+

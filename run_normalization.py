@@ -33,3 +33,4 @@ for i in range(1, 4):
             print(f"PHONETIC KEY: {row['phonetic_key']}")
             print(f"SORTED TOKEN KEY: {row['sorted_token_key']}")
             print("-" * 50)
+
