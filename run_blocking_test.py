@@ -28,8 +28,8 @@ from candidate_generator import generate_candidates
 
 # ============================================================ Configuration
 # Use the SAME config validated on training data
-TFIDF_K = 100
-CANDIDATE_CAP = 300
+TFIDF_K = 300
+CANDIDATE_CAP = 10000  # aligned to the configuration that cleared >=95% on two training samples
 
 LOAD_COLS = [
     "entity_id", "country",

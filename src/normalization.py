@@ -7,13 +7,34 @@ def normalize_text(text):
         return ""
     text = str(text)
     # Unicode normalize
+    # NFKC first folds compatibility characters (full-width forms, ligatures),
+    # then NFKD lets us remove accents while retaining non-Latin letters.
+    text = unicodedata.normalize('NFKC', text)
     text = unicodedata.normalize('NFKD', text)
+    # Strip Latin accents (cafe -> cafe), but keep vowel signs and other
+    # combining marks in scripts where they are part of the written letter.
+    kept = []
+    last_base_name = ""
+    for char in text:
+        if unicodedata.combining(char):
+            if "LATIN" not in last_base_name:
+                kept.append(char)
+            continue
+        kept.append(char)
+        last_base_name = unicodedata.name(char, "")
+    text = "".join(kept)
+    text = text.replace('&', ' and ').replace('ß', 'ss').replace('ẞ', 'SS')
     # Lowercase
     text = text.lower()
     # Replace punctuation with spaces
-    text = re.sub(r'[^\w\s]', ' ', text)
+    text = "".join(
+        char if char.isalnum() or char.isspace()
+        or unicodedata.category(char).startswith('M') else ' '
+        for char in text
+    )
     # Collapse whitespace
     text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'(?<!\w)0+(\d+)(?!\w)', r'\1', text)
     # Strip
     return text.strip()
 
@@ -21,9 +42,12 @@ def normalize_business_name(name):
     norm = normalize_text(name)
     # legal suffixes mapping
     replacements = {
-        r'\bcorporation\b': 'corp',
-        r'\bprivate\b': 'pvt',
-        r'\blimited\b': 'ltd'
+        r'\bcorporation\b': 'corp', r'\bcompany\b': 'co',
+        r'\bprivate\b': 'pvt', r'\blimited\b': 'ltd',
+        r'\bincorporated\b': 'inc', r'\b sociedades? anonimas?\b': 'sa',
+        r'\bgesellschaft mit beschrankter haftung\b': 'gmbh',
+        r'\bsociete a responsabilite limitee\b': 'sarl',
+        r'\bpublic limited company\b': 'plc',
     }
     for k, v in replacements.items():
         norm = re.sub(k, v, norm)
@@ -40,6 +64,9 @@ def normalize_address(address):
         r'\bboulevard\b': 'blvd',
         r'\blane\b': 'ln',
         r'\bsector\b': 'sec'
+        , r'\bstrasse\b': 'str', r'\bstreet\b': 'st',
+        r'\broute\b': 'rte', r'\bchemin\b': 'chem',
+        r'\bnumero\b': 'no'
     }
     for k, v in replacements.items():
         norm = re.sub(k, v, norm)

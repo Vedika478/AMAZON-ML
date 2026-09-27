@@ -8,7 +8,8 @@ Usage (from student_resource/ directory):
     python run_blocking.py --sample 2000     # sample 2000 S1 entities (quick test)
 
 Outputs:
-    output/candidate_pairs.tsv   — blocking candidates for training S1 entities
+    output/candidate_pairs_train.tsv — full-train candidates for diagnostics;
+                                       sample runs go to logs/
     logs/blocking_experiments.csv — experiment log
     logs/missed_pairs.json        — (if recall < 0.95) sample of missed pairs
 """
@@ -30,10 +31,10 @@ from candidate_generator import generate_candidates
 from evaluate_blocking import evaluate, print_missed_pairs_analysis
 
 # ============================================================ Configuration
-TFIDF_K = 100        # top-K TF-IDF neighbours per S1 record
-CANDIDATE_CAP = 300  # max candidates kept per S1 entity after union
-EXPERIMENT_ID = 3
-STRATEGIES_DESC = "9-key country blocking + consonant skeleton + TF-IDF char 1-3 fallback"
+TFIDF_K = 300        # top-K fallback neighbours per S1 record
+CANDIDATE_CAP = 10000 # recall-ceiling experiment with larger address postings
+EXPERIMENT_ID = 13
+STRATEGIES_DESC = "unweighted multi-key blocks + 10000-entry address-token reservoirs + char-TF-IDF fallback"
 NGRAM_RANGE = "(1,3)"
 RECALL_TARGET = 0.95
 
@@ -43,21 +44,31 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument(
     "--sample", type=int, default=0,
-    help="If > 0, randomly sample this many S1 entities (seed=42). 0 = use all."
+    help="If > 0, randomly sample this many S1 entities. 0 = use all."
+)
+parser.add_argument(
+    "--sample-seed", type=int, default=42,
+    help="Random seed for S1 sampling (default: 42)."
 )
 parser.add_argument(
     "--pool-limit", type=int, default=0,
     help="Optional S2/S3 row limit for a smoke test. 0 keeps the full candidate pool."
 )
+parser.add_argument(
+    "--skip-fuzzy-fallback", action="store_true",
+    help="Skip the fuzzy fallback for a fast exact-blocking diagnostic."
+)
 args = parser.parse_args()
 
 USE_SAMPLE = args.sample > 0
 NOTES = (
-    f"Sample pass (n={args.sample}, seed=42, "
+    f"Sample pass (n={args.sample}, seed={args.sample_seed}, "
     f"{'full S2/S3 pool' if args.pool_limit == 0 else f'pool limit={args.pool_limit}'})"
     if USE_SAMPLE else
-    "Targeted pass after cap-75 recall miss; full training pool"
+    f"Recall-first union; country is not a hard filter; evenly sampled large blocks; cap={CANDIDATE_CAP}"
 )
+if args.skip_fuzzy_fallback:
+    NOTES += "; fuzzy fallback disabled for this diagnostic"
 
 # ================================================================ Load data
 print("Loading normalized training data ...", flush=True)
@@ -74,14 +85,14 @@ if USE_SAMPLE:
     # true matches may occur anywhere in the full candidate pool.
     pool_kwargs = {"nrows": args.pool_limit} if args.pool_limit > 0 else {}
     pool_desc = f"S2/S3 nrows={args.pool_limit:,}" if args.pool_limit > 0 else "full S2/S3 pool"
-    print(f"  ⚡ SAMPLE MODE (seed=42, {pool_desc}):", flush=True)
+    print(f"  ⚡ SAMPLE MODE (seed={args.sample_seed}, {pool_desc}):", flush=True)
     s1_full = pd.read_csv("intermediate/s1_normalized.tsv", sep="\t",
                           dtype=str, usecols=LOAD_COLS).fillna("")
     s2 = pd.read_csv("intermediate/s2_normalized.tsv", sep="\t",
                      dtype=str, usecols=LOAD_COLS, **pool_kwargs).fillna("")
     s3 = pd.read_csv("intermediate/s3_normalized.tsv", sep="\t",
                      dtype=str, usecols=LOAD_COLS, **pool_kwargs).fillna("")
-    s1 = s1_full.sample(n=min(args.sample, len(s1_full)), random_state=42).reset_index(drop=True)
+    s1 = s1_full.sample(n=min(args.sample, len(s1_full)), random_state=args.sample_seed).reset_index(drop=True)
     del s1_full
     print(f"     S1 sample : {len(s1):,}", flush=True)
     print(f"     S2 rows   : {len(s2):,}", flush=True)
@@ -104,7 +115,8 @@ print(f"  S1: {len(s1):,} rows  |  S2: {len(s2):,} rows  |  S3: {len(s3):,} rows
 t0 = time.time()
 print(f"\nGenerating candidates  (TF-IDF K={TFIDF_K}, cap={CANDIDATE_CAP}) ...", flush=True)
 candidates_dict = generate_candidates(
-    s1, s2, s3, tfidf_k=TFIDF_K, candidate_cap=CANDIDATE_CAP
+    s1, s2, s3, tfidf_k=TFIDF_K, candidate_cap=CANDIDATE_CAP,
+    run_fuzzy_fallback=not args.skip_fuzzy_fallback,
 )
 
 t_gen = time.time() - t0
@@ -212,10 +224,14 @@ with open(log_file, "a", newline="", encoding="utf-8") as f:
     ])
 print(f"\nLogged experiment → {log_file}")
 
-# ========================================= Save candidate_pairs.tsv (training)
+# ========================================= Save training diagnostics separately
 os.makedirs("output", exist_ok=True)
-out_path = "output/candidate_pairs.tsv"
-print(f"\nSaving candidate pairs → {out_path} ...")
+out_path = (
+    "logs/candidate_pairs_train_sample.tsv" if USE_SAMPLE
+    else "output/candidate_pairs_train.tsv"
+)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+print(f"\nSaving training candidates → {out_path} ...")
 
 all_s1_ids = s1["entity_id"].tolist()
 with open(out_path, "w", encoding="utf-8", newline="") as f:

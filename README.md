@@ -1,5 +1,33 @@
 # ML Challenge 2026 Problem Statement
 
+## Pipeline notes
+
+The shared normalization code in `src/normalization.py` is used by both
+`run_normalization.py` (training S1/S2/S3) and `run_normalization_test.py` (test
+S1/S2/S3). After changing normalization, regenerate the ignored intermediate
+files before blocking:
+
+```bash
+python run_normalization.py
+python run_blocking.py --sample 200
+```
+
+The test path uses the same normalization functions:
+
+```bash
+python run_normalization_test.py
+python run_blocking_test.py
+```
+
+Candidate generation unions country-aware and country-agnostic name keys,
+address/name keys, partial address-token keys for entities with thin coverage,
+and a character TF-IDF fallback. Country is never a hard eligibility filter.
+Large blocks are sampled across their full membership, candidates are
+deduplicated, and the recall-first cap is 1,000. The returned interface remains
+`{source1_entity_id: [candidate_entity_id, ...]}` for the downstream feature and
+model stages. Normalized intermediate data, experiment logs, and generated
+candidate output remain local and are not committed.
+
 ## Business Entity Resolution Challenge
 
 In large-scale commercial platforms, business identity data arrives from multiple independent sources — each contributing partial, noisy fragments of information about the same real-world entities. These fragments share no common identifiers, and the challenge of determining which records refer to the same business is known as Entity Resolution (ER). Your challenge is to build an ML solution that, given business records from 3 independent data sources with noisy and inconsistent fields, determines which records across sources refer to the same real-world business entity.
@@ -51,6 +79,20 @@ The ground truth file (`train_ground_truth.tsv`) has two columns:
 2. **dataset/train/train_source2.tsv:** Source 2 training records
 3. **dataset/train/train_source3.tsv:** Source 3 training records
 4. **dataset/train/train_ground_truth.tsv:** Ground truth matching labels for the training set
+
+### Person 2 training handoff
+
+The normalized training tables and labels used by the blocking validation are:
+
+- `intermediate/s1_normalized.tsv`
+- `intermediate/s2_normalized.tsv`
+- `intermediate/s3_normalized.tsv`
+- `dataset/train/train_ground_truth.tsv`
+
+The normalized tables retain the entity IDs, country, normalized names and
+addresses, phonetic keys, and sorted-token keys. The ground-truth file supplies
+the labeled S1-to-S2/S3 matches. No Person 2 model-training implementation is
+included in this repository; these are the training inputs for that stage.
 
 *Test files*
 
